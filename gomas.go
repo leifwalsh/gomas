@@ -29,6 +29,60 @@ const (
 	docHandlers  = 32 // threads pushing into mongo
 )
 
+func latencyQuantiles(latencies <-chan time.Duration) (windowed *quantile.Stream, cumulative *quantile.Stream) {
+	windowed = quantile.NewTargeted(0.50, 0.90, 0.99)
+	cumulative = quantile.NewTargeted(0.50, 0.90, 0.99)
+	go func() {
+		for t := range latencies {
+			var v float64 = float64(t) / float64(time.Millisecond)
+			windowed.Insert(v)
+			cumulative.Insert(v)
+		}
+	}()
+	return
+}
+
+func printer(insertCounter *uint64, wq *quantile.Stream, cq *quantile.Stream) (killer chan bool) {
+	killer = make(chan bool)
+	go func() {
+		var (
+			lastCount    uint64 = 0
+			linesPrinted int    = 0
+			ok           bool   = true
+		)
+		start := time.Now()
+		ticks := time.NewTicker(time.Second)
+		last := start
+		_, ok = <-ticks.C
+		for ok {
+			thisCount := atomic.LoadUint64(insertCounter)
+			diff := thisCount - lastCount
+			now := time.Now()
+			idur := now.Sub(last)
+			cdur := now.Sub(start)
+			if linesPrinted%24 == 0 {
+				log.Printf("-- docs -- -------- ips ------- ------- window latency ------- ----- cumulative latency ----\n")
+				log.Printf("    total |     iter       cum |      50%%       90%%       99%% |      50%%       90%%       99%%\n")
+			}
+			linesPrinted++
+			log.Printf("%9d |%9.2f %9.2f |%9.3f %9.3f %9.3f |%9.3f %9.3f %9.3f\n",
+				thisCount, float64(diff)/idur.Seconds(), float64(thisCount)/cdur.Seconds(),
+				wq.Query(0.50), wq.Query(0.90), wq.Query(0.99),
+				cq.Query(0.50), cq.Query(0.90), cq.Query(0.99))
+			wq.Reset()
+
+			select {
+			case _, ok = <-ticks.C:
+				lastCount = thisCount
+				last = now
+			case <-killer:
+				break
+			}
+		}
+	}()
+	return
+}
+
 func codeToProject(code string) (project string, err error) {
 	switch code {
 	case "b":
@@ -145,47 +199,12 @@ func main() {
 		docsDone             = sync.WaitGroup{}
 		docs                 = make(chan bson.M, 5000)
 		insertCounter uint64 = 0
-		kill                 = make(chan bool)
-		cq                   = quantile.NewTargeted(0.50, 0.90, 0.99)
-		wq                   = quantile.NewTargeted(0.50, 0.90, 0.99)
 		latencies            = make(chan time.Duration)
 	)
-	go func() {
-		for t := range latencies {
-			var v float64 = float64(t) / float64(time.Millisecond)
-			cq.Insert(v)
-			wq.Insert(v)
-		}
-	}()
-	go func() {
-		start := time.Now()
-		ticks := time.NewTicker(time.Second)
-		_, ok := <-ticks.C
-		last := start
-		var lastCount uint64 = 0
-		var linesPrinted int = 0
-		for ok {
-			thisCount := atomic.LoadUint64(&insertCounter)
-			diff := thisCount - lastCount
-			now := time.Now()
-			idur := now.Sub(last)
-			cdur := now.Sub(start)
-			if linesPrinted%24 == 0 {
-				log.Printf("-- docs -- -------- ips ------- ------- window latency ------- ----- cumulative latency ----\n")
-				log.Printf("    total |     iter       cum |      50%%       90%%       99%% |      50%%       90%%       99%%\n")
-			}
-			linesPrinted++
-			log.Printf("%9d |%9.2f %9.2f |%9.3f %9.3f %9.3f |%9.3f %9.3f %9.3f\n", thisCount, float64(diff)/idur.Seconds(), float64(thisCount)/cdur.Seconds(), wq.Query(0.50), wq.Query(0.90), wq.Query(0.99), cq.Query(0.50), cq.Query(0.90), cq.Query(0.99))
-			wq.Reset()
-			select {
-			case _, ok = <-ticks.C:
-				lastCount = thisCount
-				last = now
-			case <-kill:
-				break
-			}
-		}
-	}()
+
+	wq, cq := latencyQuantiles(latencies)
+	killPrinter := printer(&insertCounter, wq, cq)
+
 	for i := 0; i < lineHandlers; i++ {
 		linesDone.Add(1)
 		go func() {
@@ -337,5 +356,5 @@ func main() {
 	close(docs)
 	docsDone.Wait()
 	close(latencies)
-	kill <- true
+	killPrinter <- true
 }
