@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"errors"
+	"flag"
 	"fmt"
 	"github.com/bmizerany/perks/quantile"
 	"io"
@@ -12,6 +13,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,14 +103,38 @@ func retryInsert(coll *mgo.Collection, batch ...interface{}) (err error) {
 	return
 }
 
-func main() {
-	sess, err := mgo.Dial("localhost")
+func readFileIntoLines(reader io.Reader, date time.Time, lines chan<- RawRecord) (err error) {
+	raw, err := gzip.NewReader(reader)
 	if err != nil {
-		log.Fatal("Error connecting to mongo: ", err)
+		return
+	}
+	defer raw.Close()
+
+	sc := bufio.NewScanner(raw)
+	for sc.Scan() {
+		lines <- RawRecord{sc.Text(), date}
+	}
+	err = sc.Err()
+	return
+}
+
+func main() {
+	var (
+		host     = flag.String("host", "localhost", "host:port string of database to connect to")
+		dbname   = flag.String("db", "wiki", "dbname")
+		collname = flag.String("coll", "rawlogs", "collname")
+		source   = flag.String("source", "/mnt/wiki/wikistats/pagecounts/", "directory or http resource (e.g. http://dumps.wikimedia.org/other/pagecounts-raw/) containing pagecounts data")
+	)
+
+	flag.Parse()
+
+	sess, err := mgo.Dial(*host)
+	if err != nil {
+		log.Fatal("Error connecting to ", *host, ": ", err)
 	}
 	defer sess.Close()
 	//sess.SetSafe(nil) //&mgo.Safe{WMode: "majority"})
-	coll := sess.DB("wiki").C("rawlogs")
+	coll := sess.DB(*dbname).C(*collname)
 	if err := coll.DropCollection(); err != nil {
 		log.Println(err)
 	}
@@ -204,29 +232,17 @@ func main() {
 		}()
 	}
 
-	var (
-		timesDone = sync.WaitGroup{}
-		times     = make(chan time.Time, 10)
-	)
-	for i := 0; i < timeHandlers; i++ {
-		timesDone.Add(1)
-		go func() {
-			for t := range times {
-				filename := fmt.Sprintf("http://dumps.wikimedia.org/other/pagecounts-raw/%04d/%04d-%02d/pagecounts-%04d%02d%02d-%02d0000.gz", t.Year(), t.Year(), t.Month(), t.Year(), t.Month(), t.Day(), t.Hour())
-				resp, err := http.Get(filename)
-				if err != nil {
-					if err == io.EOF || strings.HasSuffix(err.Error(), "EOF") {
-						log.Println("EOF getting file ", filename)
-						times <- t
-						time.Sleep(time.Second)
-						continue
-					}
-					log.Fatal("Error getting file ", filename, ": ", err)
-				}
-				if resp.StatusCode == 404 {
-					resp.Body.Close()
-					filename = fmt.Sprintf("http://dumps.wikimedia.org/other/pagecounts-raw/%04d/%04d-%02d/pagecounts-%04d%02d%02d-%02d0001.gz", t.Year(), t.Year(), t.Month(), t.Year(), t.Month(), t.Day(), t.Hour())
-					resp, err = http.Get(filename)
+	if strings.HasPrefix(*source, "http://") {
+		var (
+			timesDone = sync.WaitGroup{}
+			times     = make(chan time.Time, 10)
+		)
+		for i := 0; i < timeHandlers; i++ {
+			timesDone.Add(1)
+			go func() {
+				for t := range times {
+					filename := fmt.Sprintf(*source+"%04d/%04d-%02d/pagecounts-%04d%02d%02d-%02d0000.gz", t.Year(), t.Year(), t.Month(), t.Year(), t.Month(), t.Day(), t.Hour())
+					resp, err := http.Get(filename)
 					if err != nil {
 						if err == io.EOF || strings.HasSuffix(err.Error(), "EOF") {
 							log.Println("EOF getting file ", filename)
@@ -236,44 +252,86 @@ func main() {
 						}
 						log.Fatal("Error getting file ", filename, ": ", err)
 					}
-				}
-				defer resp.Body.Close()
+					if resp.StatusCode == 404 {
+						resp.Body.Close()
+						filename = fmt.Sprintf(*source+"%04d/%04d-%02d/pagecounts-%04d%02d%02d-%02d0001.gz", t.Year(), t.Year(), t.Month(), t.Year(), t.Month(), t.Day(), t.Hour())
+						resp, err = http.Get(filename)
+						if err != nil {
+							if err == io.EOF || strings.HasSuffix(err.Error(), "EOF") {
+								log.Println("EOF getting file ", filename)
+								times <- t
+								time.Sleep(time.Second)
+								continue
+							}
+							log.Fatal("Error getting file ", filename, ": ", err)
+						}
+					}
+					defer resp.Body.Close()
 
-				if resp.StatusCode != 200 {
-					log.Println("HTTP status", resp.StatusCode, "while getting", filename)
-					continue
-				}
-
-				raw, err := gzip.NewReader(resp.Body)
-				if err != nil {
-					if err == io.EOF {
-						log.Println("EOF unzipping file ", filename)
+					if resp.StatusCode != 200 {
+						log.Println("HTTP status", resp.StatusCode, "while getting", filename)
 						continue
 					}
-					log.Fatal("Error unzipping file ", filename, ": ", err)
-				}
-				defer raw.Close()
 
-				sc := bufio.NewScanner(raw)
-				for sc.Scan() {
-					lines <- RawRecord{sc.Text(), t}
+					if err := readFileIntoLines(resp.Body, t, lines); err != nil {
+						log.Fatal(err)
+					}
 				}
-				if err := sc.Err(); err != nil {
-					log.Fatal("Error reading from Scanner for file ", filename, ": ", err)
-				}
+
+				timesDone.Done()
+			}()
+		}
+
+		var twoThousandFourteen = time.Date(2014, time.January, 1, 0, 0, 0, 0, time.UTC)
+		for date := time.Date(2008, time.January, 1, 0, 0, 0, 0, time.UTC); date.Before(twoThousandFourteen); date = date.Add(time.Hour) {
+			times <- date
+		}
+
+		close(times)
+		timesDone.Wait()
+	} else {
+		texasRanger := func(path string, info os.FileInfo, ein error) (err error) {
+			if info.IsDir() {
+				return
 			}
 
-			timesDone.Done()
-		}()
+			file, err := os.Open(path)
+			if err != nil {
+				log.Fatal("Error opening ", path, ": ", err)
+			}
+			defer file.Close()
+
+			re := regexp.MustCompile("pagecounts-(\\d{4})(\\d{2})(\\d{2})-(\\d{2})000[01].gz")
+			matches := re.FindStringSubmatch(filepath.Base(path))
+			if len(matches) == 0 {
+				log.Fatal("Unexpected filename ", path)
+			}
+			year, err := strconv.Atoi(matches[1])
+			if err != nil {
+				return
+			}
+			month, err := strconv.Atoi(matches[2])
+			if err != nil {
+				return
+			}
+			day, err := strconv.Atoi(matches[3])
+			if err != nil {
+				return
+			}
+			hour, err := strconv.Atoi(matches[4])
+			if err != nil {
+				return
+			}
+
+			date := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.UTC)
+
+			err = readFileIntoLines(file, date, lines)
+			return
+		}
+
+		filepath.Walk(*source, texasRanger)
 	}
 
-	var twoThousandFourteen = time.Date(2014, time.January, 1, 0, 0, 0, 0, time.UTC)
-	for date := time.Date(2008, time.January, 1, 0, 0, 0, 0, time.UTC); date.Before(twoThousandFourteen); date = date.Add(time.Hour) {
-		times <- date
-	}
-
-	close(times)
-	timesDone.Wait()
 	close(lines)
 	linesDone.Wait()
 	close(docs)
