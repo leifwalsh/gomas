@@ -11,6 +11,7 @@ import (
 	"labix.org/v2/mgo"
 	"labix.org/v2/mgo/bson"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -147,7 +148,7 @@ func parseLine(rec RawRecord) (entry bson.M, err error) {
 }
 
 func retryInsert(coll *mgo.Collection, batch ...interface{}) (err error) {
-	for err := coll.Insert(batch...); err != nil; err = coll.Insert(batch...) {
+	for err = coll.Insert(batch...); err != nil; err = coll.Insert(batch...) {
 		if lerr, ok := err.(*mgo.LastError); !ok || lerr.Code != 16759 {
 			break
 		}
@@ -223,15 +224,24 @@ func main() {
 	for i := 0; i < docHandlers; i++ {
 		docsDone.Add(1)
 		go func() {
-			workerSession := sess.New()
+			workerSession := sess.Copy()
 			defer workerSession.Close()
 			coll := workerSession.DB("wiki").C("rawlogs")
 			batch := make([]interface{}, 0, 100)
 			for doc := range docs {
 				batch = append(batch, doc)
 				if len(batch) == cap(batch) {
+					tries := 0
 					t0 := time.Now()
-					if err := retryInsert(coll, batch...); err != nil {
+					for err := retryInsert(coll, batch...); err != nil; err = retryInsert(coll, batch...) {
+						if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+							tries++
+							if tries > 30 {
+								log.Fatal("Tried 30 times to insert the same batch, got", neterr)
+							}
+							workerSession.Refresh()
+							continue
+						}
 						log.Fatal("Error inserting batch: ", err)
 					}
 					atomic.AddUint64(&insertCounter, uint64(len(batch)))
@@ -240,8 +250,17 @@ func main() {
 				}
 			}
 			if len(batch) > 0 {
+				tries := 0
 				t0 := time.Now()
-				if err := retryInsert(coll, batch...); err != nil {
+				for err := retryInsert(coll, batch...); err != nil; err = retryInsert(coll, batch...) {
+					if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+						tries++
+						if tries > 30 {
+							log.Fatal("Tried 30 times to insert the same batch, got", err)
+						}
+						workerSession.Refresh()
+						continue
+					}
 					log.Fatal("Error inserting batch: ", err)
 				}
 				atomic.AddUint64(&insertCounter, uint64(len(batch)))
