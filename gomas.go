@@ -26,8 +26,8 @@ import (
 
 const (
 	timeHandlers = 1  // threads pulling from the web, unzipping, chopping into lines (beware webserver throttle)
-	lineHandlers = 8  // threads parsing lines into bson.M objects
-	docHandlers  = 32 // threads pushing into mongo
+	lineHandlers = 4  // threads parsing lines into bson.M objects
+	docHandlers  = 16 // threads pushing into mongo
 )
 
 func latencyQuantiles(latencies <-chan time.Duration) (windowed *quantile.Stream, cumulative *quantile.Stream) {
@@ -118,6 +118,10 @@ type RawRecord struct {
 func parseLine(rec RawRecord) (entry bson.M, err error) {
 	doc := make(bson.M)
 	parts := strings.Split(rec.line, " ")
+	if len(parts) < 4 {
+		err = errors.New("parsing \"" + rec.line + "\": not enough space-separated fields")
+		return
+	}
 	siteparts := strings.Split(parts[0], ".")
 	doc["lang"] = siteparts[0]
 	doc["project"] = "wikipedia"
@@ -189,10 +193,10 @@ func main() {
 	}
 	defer sess.Close()
 	//sess.SetSafe(nil) //&mgo.Safe{WMode: "majority"})
-	coll := sess.DB(*dbname).C(*collname)
-	if err := coll.DropCollection(); err != nil {
-		log.Println(err)
-	}
+	//coll := sess.DB(*dbname).C(*collname)
+	//if err := coll.DropCollection(); err != nil {
+	//	log.Println(err)
+	//}
 
 	var (
 		linesDone            = sync.WaitGroup{}
@@ -226,7 +230,7 @@ func main() {
 		go func() {
 			workerSession := sess.Copy()
 			defer workerSession.Close()
-			coll := workerSession.DB("wiki").C("rawlogs")
+			coll := workerSession.DB(*dbname).C(*collname)
 			batch := make([]interface{}, 0, 100)
 			for doc := range docs {
 				batch = append(batch, doc)
@@ -284,8 +288,13 @@ func main() {
 					if err != nil {
 						if err == io.EOF || strings.HasSuffix(err.Error(), "EOF") {
 							log.Println("EOF getting file ", filename)
-							times <- t
+							//times <- t
 							time.Sleep(time.Second)
+							continue
+						}
+						if strings.HasSuffix(err.Error(), "http: can't write HTTP request on broken connection") {
+							log.Println("Error getting ", filename, ": ", err)
+							log.Println("Ignoring for now...")
 							continue
 						}
 						log.Fatal("Error getting file ", filename, ": ", err)
@@ -297,8 +306,13 @@ func main() {
 						if err != nil {
 							if err == io.EOF || strings.HasSuffix(err.Error(), "EOF") {
 								log.Println("EOF getting file ", filename)
-								times <- t
+								//times <- t
 								time.Sleep(time.Second)
+								continue
+							}
+							if strings.HasSuffix(err.Error(), "http: can't write HTTP request on broken connection") {
+								log.Println("Error getting ", filename, ": ", err)
+								log.Println("Ignoring for now...")
 								continue
 							}
 							log.Fatal("Error getting file ", filename, ": ", err)
@@ -312,7 +326,8 @@ func main() {
 					}
 
 					if err := readFileIntoLines(resp.Body, t, lines); err != nil {
-						log.Fatal(err)
+						log.Println("Error reading from response body for file ", filename, ": ", err)
+						continue
 					}
 				}
 
